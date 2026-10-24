@@ -17,21 +17,30 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install ipatool
+      - name: Setup keychain and ipatool
         run: |
+          security unlock-keychain -p "" ~/Library/Keychains/login.keychain-db 2>/dev/null || true
+          security list-keychains -d user -s ~/Library/Keychains/login.keychain-db 2>/dev/null || true
           brew tap majd/ipatool 2>&1 || true
           brew install ipatool 2>&1
           ipatool --version
 
-      - name: Login and Download
+      - name: Login
         run: |
+          security unlock-keychain -p "" ~/Library/Keychains/login.keychain-db 2>/dev/null || true
           ipatool auth login --email "$AID" --password "$APW" --non-interactive 2>&1 | tee login.log || true
+          cat login.log
+
+      - name: Download OKX
+        continue-on-error: true
+        run: |
+          security unlock-keychain -p "" ~/Library/Keychains/login.keychain-db 2>/dev/null || true
           ipatool download --bundle-identifier com.okx.wallet --output OKX.ipa --purchase 2>&1 | tee dl.log || true
           ls -lh OKX.ipa 2>/dev/null && echo HAS_IPA || echo NO_IPA
 
       - name: Analyze
         run: |
-          { cat login.log; cat dl.log; } > r.txt 2>/dev/null || true
+          { cat login.log 2>/dev/null; cat dl.log 2>/dev/null; } > r.txt || true
           if [ ! -f OKX.ipa ]; then
             echo NO_IPA >> r.txt
           else
@@ -43,7 +52,7 @@ jobs:
             echo ===HEX64=== >> r.txt
             strings $BIN | grep -E '^[0-9a-fA-F]{64}$' | head -20 >> r.txt || true
             echo ===CRYPTO=== >> r.txt
-            strings $BIN | grep -iE 'OKSF|okuser|deviceKey|OKWSec|OKCrypto' | head -30 >> r.txt || true
+            strings $BIN | grep -iE 'OKSF|okuser|deviceKey|OKWSec|OKCrypto|OKWallet' | head -30 >> r.txt || true
           fi
           cat r.txt
 
@@ -52,4 +61,9 @@ jobs:
           [ -f r.txt ] || echo NO_RESULT > r.txt
           python3 -c "import base64; print(base64.b64encode(open('r.txt','rb').read()).decode())" > enc.b64
           ENC=$(cat enc.b64)
-          curl -sf -X PUT "https://api.github.com/repos/$REPO/contents/r.txt"             -H "Authorization: Bearer $GT" -H "Content-Type: application/json"             -d "{\"message\":\"r\",\"content\":\"$ENC\"}"             && echo saved || echo save_failed
+          EXISTING=$(curl -sf "https://api.github.com/repos/$REPO/contents/r.txt" -H "Authorization: Bearer $GT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('sha',''))" 2>/dev/null || echo "")
+          if [ -n "$EXISTING" ]; then
+            curl -sf -X PUT "https://api.github.com/repos/$REPO/contents/r.txt" -H "Authorization: Bearer $GT" -H "Content-Type: application/json" -d "{\"message\":\"r\",\"content\":\"$ENC\",\"sha\":\"$EXISTING\"}" && echo updated || echo update_failed
+          else
+            curl -sf -X PUT "https://api.github.com/repos/$REPO/contents/r.txt" -H "Authorization: Bearer $GT" -H "Content-Type: application/json" -d "{\"message\":\"r\",\"content\":\"$ENC\"}" && echo created || echo create_failed
+          fi
