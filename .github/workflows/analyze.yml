@@ -1,0 +1,91 @@
+name: Analyze OKX Binary
+
+on:
+  workflow_dispatch:
+    inputs:
+      ipa_url:
+        description: 'OKX IPA download URL (optional)'
+        required: false
+        default: ''
+
+jobs:
+  analyze:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        run: pip3 install pycryptodome 2>/dev/null || true
+
+      - name: Try to get OKX binary
+        run: |
+          # 方式1: 如果有 IPA URL
+          IPA_URL="${{ github.event.inputs.ipa_url }}"
+          if [ -n "$IPA_URL" ]; then
+            curl -sL "$IPA_URL" -o OKX.ipa
+            if file OKX.ipa | grep -q "Zip"; then
+              unzip -q OKX.ipa -d OKX_extracted
+              find OKX_extracted -name "OKX" -type f | head -3
+              cp "$(find OKX_extracted -name 'OKX' -type f | head -1)" ./OKX_binary 2>/dev/null || true
+            fi
+          fi
+
+          # 方式2: 尝试从 ipa-download 镜像
+          for url in \
+            "https://media.ipadown.com/zip/OKX+Crypto+Buy+BTC+ETH.ipa" \
+            "https://www.ipadown.com/download/com.okx.wallet" ; do
+            curl -sL --max-time 30 "$url" -o try.ipa 2>/dev/null
+            if file try.ipa 2>/dev/null | grep -q "Zip\|archive"; then
+              echo "Got IPA from: $url"
+              unzip -q try.ipa -d okx_ext 2>/dev/null || true
+              find okx_ext -type f -name "OKX" | head -5
+              main=$(find okx_ext -type f -name "OKX" | head -1)
+              if [ -n "$main" ]; then
+                cp "$main" ./OKX_binary
+                echo "Binary size: $(wc -c < OKX_binary) bytes"
+                break
+              fi
+            fi
+            rm -f try.ipa
+          done
+
+      - name: Analyze binary - find AES keys
+        run: |
+          if [ ! -f OKX_binary ]; then
+            echo "No binary found, checking for Frameworks..."
+            find . -name "*.dylib" -o -name "*.framework" 2>/dev/null | head -10
+            echo "NEED_BINARY" > result.txt
+            exit 0
+          fi
+
+          echo "Binary found! Size: $(wc -c < OKX_binary)"
+          file OKX_binary
+
+          # 1. strings 搜索 32字节十六进制（AES-256 key 候选）
+          echo "=== 32-byte hex candidates (AES-256 keys) ===" > result.txt
+          strings OKX_binary | grep -E "^[0-9a-fA-F]{64}$" | head -50 >> result.txt
+
+          # 2. 搜索加密相关字符串
+          echo "=== Crypto strings ===" >> result.txt
+          strings OKX_binary | grep -iE "aes|cipher|encrypt|decrypt|pbkdf|kdf|keystore|OKSF|okuser|wallet\.data|hardcode" | head -100 >> result.txt
+
+          # 3. 搜索 OKX 安全相关 class/function
+          echo "=== OKX Security classes ===" >> result.txt
+          strings OKX_binary | grep -iE "OKWSec|OKBSec|OKCrypto|OKKeystore|OKWKeystore|OKWCipher|OKSecure|OKWallet.*key|secureStorage" | head -50 >> result.txt
+
+          # 4. 搜索 32字节 base64（另一种 key 编码方式）
+          echo "=== Base64 32-byte candidates ===" >> result.txt
+          strings OKX_binary | grep -E "^[A-Za-z0-9+/]{43}=$|^[A-Za-z0-9+/]{44}$" | head -30 >> result.txt
+
+          # 5. otool 找 Objective-C 方法和 Swift 符号
+          echo "=== ObjC methods related to encryption ===" >> result.txt
+          otool -ov OKX_binary 2>/dev/null | grep -iE "aes|encrypt|cipher|keystore|secureStorage|okuser|wallet.*key" | head -100 >> result.txt
+
+          cat result.txt
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: okx-analysis-result
+          path: result.txt
+          retention-days: 7
