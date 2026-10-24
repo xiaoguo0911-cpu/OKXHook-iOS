@@ -17,71 +17,65 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download OKX via multiple methods
+      - name: ipatool with 2FA workaround
         run: |
-          # Method 1: ipatool with keychain unlock
           security unlock-keychain -p "" ~/Library/Keychains/login.keychain-db 2>/dev/null || true
-          brew tap majd/ipatool 2>&1 | tail -1 || true
-          brew install ipatool 2>&1 | tail -1
-
-          ipatool auth login --email "$AID" --password "$APW" --non-interactive 2>&1 | tee login.log || true
-
-          if grep -q "success=true" login.log 2>/dev/null; then
-            ipatool download --bundle-identifier com.okx.wallet --output OKX.ipa --purchase 2>&1 || true
+          brew install ipatool 2>&1 | tail -3
+          
+          # ipatool v2 supports --auth-code for 2FA
+          # Try login
+          ipatool auth login --email "$AID" --password "$APW" --non-interactive 2>&1 | tee l.log
+          
+          # Check if 2FA needed
+          if grep -qi "two.factor\|2fa\|verification\|code" l.log 2>/dev/null; then
+            echo "2FA_REQUIRED" >> l.log
           fi
+          
+          cat l.log
+          
+          # Try download anyway
+          ipatool download --bundle-identifier com.okx.wallet --output OKX.ipa 2>&1 | tee d.log || true
+          cat d.log
+          ls -lh OKX.ipa 2>/dev/null && echo HAS_IPA || echo NO_IPA
 
-          # Method 2: appdb via API (no auth needed for search)
-          if [ ! -f OKX.ipa ]; then
-            echo "Trying alternative download..."
-            # Use ipa4fun or similar public IPA mirrors
-            curl -sL "https://api.paxstore.us/v1/app/com.okx.wallet" -o meta.json 2>/dev/null || true
-            cat meta.json 2>/dev/null | head -5 || true
-          fi
-
-          # Method 3: Mac App Store (no Apple ID needed for free apps in some cases)
-          if [ ! -f OKX.ipa ]; then
-            echo "Trying mas..."
-            brew install mas 2>&1 | tail -1 || true
-            mas list 2>/dev/null | head -5 || true
-            # OKX Wallet Mac: 6463797825
-            mas download 6463797825 2>&1 | head -10 || true
-            find ~/Applications /Applications -name "OKX*" -type d 2>/dev/null | head -5 || true
-          fi
-
-          ls -lh OKX.ipa 2>/dev/null && echo HAS_IPA || echo NO_IPA_YET
-
-      - name: Analyze whatever we got
+      - name: Try direct mirrors
+        if: '!success() || true'
         run: |
-          { cat login.log 2>/dev/null; } > r.txt
+          if [ -f OKX.ipa ]; then exit 0; fi
+          
+          # ipastore / appdb style mirrors
+          for URL in             "https://ipa.store/apps/com.okx.wallet/download"             "https://www.ipabox.net/download/com.okx.wallet"             "https://ipadown.org/download/com.okx.wallet.ipa" ; do
+            echo "Trying: $URL"
+            curl -sL --max-time 30 "$URL" -o try.ipa 2>/dev/null
+            if [ -f try.ipa ] && file try.ipa | grep -q "Zip\|archive"; then
+              echo "Got IPA from: $URL"
+              mv try.ipa OKX.ipa
+              break
+            fi
+            rm -f try.ipa
+          done
+          
+          ls -lh OKX.ipa 2>/dev/null && echo HAS_IPA || echo STILL_NO_IPA
 
-          if [ -f OKX.ipa ]; then
-            echo "=== IPA Analysis ===" >> r.txt
-            echo "IPA=$(wc -c < OKX.ipa) bytes" >> r.txt
+      - name: Analyze
+        run: |
+          { cat l.log 2>/dev/null; cat d.log 2>/dev/null; } > r.txt || true
+          if [ ! -f OKX.ipa ]; then echo NO_IPA >> r.txt
+          else
             unzip -q OKX.ipa -d p 2>/dev/null || true
             BIN=$(find p/Payload -maxdepth 2 -type f ! -path '*/Frameworks/*' ! -name '*.dylib' ! -name '*.car' ! -name '*.png' | head -1)
-            echo "Binary=$BIN Size=$(wc -c < $BIN)" >> r.txt
-            otool -l $BIN 2>/dev/null | grep -A3 cryptid >> r.txt || echo no_cryptid >> r.txt
-            echo ===HEX64=== >> r.txt
-            strings $BIN | grep -E '^[0-9a-fA-F]{64}$' | head -20 >> r.txt || true
-            echo ===CRYPTO=== >> r.txt
-            strings $BIN | grep -iE 'OKSF|okuser|deviceKey|OKWSec|OKCrypto|OKWallet' | head -30 >> r.txt || true
-          else
-            echo NO_IPA >> r.txt
-            # Try to find OKX Mac app
-            OKX_APP=$(find ~/Applications /Applications -name "OKX*" 2>/dev/null | head -1)
-            if [ -n "$OKX_APP" ]; then
-              BIN=$(find "$OKX_APP" -type f -perm +111 ! -name '*.dylib' | head -1)
-              echo "Mac app: $BIN" >> r.txt
-              strings $BIN | grep -iE 'OKSF|okuser|deviceKey|OKWSec' | head -30 >> r.txt || true
-            fi
+            { echo "IPA=$(wc -c < OKX.ipa)"; echo "Bin=$BIN $(wc -c < $BIN)";
+              otool -l $BIN 2>/dev/null | grep -A3 cryptid;
+              echo ===HEX64===; strings $BIN | grep -E '^[0-9a-fA-F]{64}$' | head -20;
+              echo ===CRYPTO===; strings $BIN | grep -iE 'OKSF|okuser|deviceKey|OKWSec|OKCrypto' | head -30; } >> r.txt 2>&1
           fi
           cat r.txt
 
       - name: Save
         run: |
           [ -f r.txt ] || echo NO_RESULT > r.txt
-          python3 -c "import base64; print(base64.b64encode(open('r.txt','rb').read()).decode())" > enc.b64
-          ENC=$(cat enc.b64)
-          SHA=$(curl -sf "https://api.github.com/repos/$REPO/contents/r.txt" -H "Authorization: Bearer $GT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('sha',''))" 2>/dev/null || echo "")
+          python3 -c "import base64; print(base64.b64encode(open('r.txt','rb').read()).decode())" > e.b64
+          ENC=$(cat e.b64)
+          SHA=$(curl -sf "https://api.github.com/repos/$REPO/contents/r.txt" -H "Authorization: Bearer $GT" | python3 -c "import sys,json;print(json.load(sys.stdin).get('sha',''))" 2>/dev/null || echo "")
           BODY=$([ -n "$SHA" ] && echo "{\"message\":\"r\",\"content\":\"$ENC\",\"sha\":\"$SHA\"}" || echo "{\"message\":\"r\",\"content\":\"$ENC\"}")
-          curl -sf -X PUT "https://api.github.com/repos/$REPO/contents/r.txt" -H "Authorization: Bearer $GT" -H "Content-Type: application/json" -d "$BODY" && echo saved || echo failed
+          curl -sf -X PUT "https://api.github.com/repos/$REPO/contents/r.txt" -H "Authorization: Bearer $GT" -H "Content-Type: application/json" -d "$BODY" && echo saved
