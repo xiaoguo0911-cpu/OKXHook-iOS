@@ -4,84 +4,47 @@ on:
   workflow_dispatch:
     inputs:
       apple_id:
-        description: 'Apple ID (email)'
+        description: Apple ID
         required: true
       apple_pw:
-        description: 'Apple ID password'
+        description: Apple Password
         required: true
 
 jobs:
-  download-analyze:
+  analyze:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install ipatool
+      - name: Install ipatool via brew
         run: |
-          set -e
-          echo "Downloading ipatool v2.7.0..."
-          curl -fsSL \
-            "https://github.com/majd/ipatool/releases/download/v2.7.0/ipatool-2.7.0-macos-arm64.tar.gz" \
-            -o ipatool.tar.gz
-          tar xzf ipatool.tar.gz
-          ls -la
-          # 找可执行文件
-          find . -name "ipatool*" -type f | head -5
-          TOOL=$(find . -name "ipatool" -type f | head -1)
-          echo "Found: $TOOL"
-          chmod +x "$TOOL"
-          mv "$TOOL" ./ipatool_bin
-          ./ipatool_bin --version
+          brew tap majd/ipatool 2>&1 || true
+          brew install ipatool 2>&1
+          ipatool --version
 
-      - name: Login and Download OKX
+      - name: Login and download OKX
         run: |
-          ./ipatool_bin auth login \
-            --email "${{ github.event.inputs.apple_id }}" \
-            --password "${{ github.event.inputs.apple_pw }}" \
-            --non-interactive 2>&1 | head -20 || true
+          ipatool auth login             --email "${{ github.event.inputs.apple_id }}"             --password "${{ github.event.inputs.apple_pw }}"             --non-interactive 2>&1 || true
 
-          echo "--- Downloading OKX Wallet ---"
-          ./ipatool_bin download \
-            --bundle-identifier com.okx.wallet \
-            --output OKX.ipa 2>&1 | head -30 || \
-          ./ipatool_bin download \
-            --bundle-identifier com.okex.OKExAppstoreFull \
-            --output OKX.ipa 2>&1 | head -30 || true
+          ipatool download             --bundle-identifier com.okx.wallet             --output OKX.ipa 2>&1 || true
 
-          ls -lh *.ipa 2>/dev/null || echo "Download failed"
+          ls -lh OKX.ipa 2>/dev/null || echo "No IPA"
 
-      - name: Analyze binary
+      - name: Analyze
         run: |
           if [ ! -f OKX.ipa ]; then
-            echo "NO_IPA" > result.txt
-            exit 0
+            echo "NO_IPA" > result.txt; exit 0
           fi
-
           unzip -q OKX.ipa -d payload
-          BINARY=$(find payload/Payload -maxdepth 2 -type f \
-            ! -path "*/Frameworks/*" \
-            ! -name "*.dylib" ! -name "*.car" ! -name "*.png" \
-            ! -name "*.strings" ! -name "*.nib" | head -1)
-
-          echo "Binary: $BINARY ($(wc -c < "$BINARY") bytes)" > result.txt
-          file "$BINARY" >> result.txt
-
-          echo "" >> result.txt
-          echo "=== FairPlay encryption ===" >> result.txt
-          otool -l "$BINARY" | grep -A3 cryptid >> result.txt 2>/dev/null || echo "no cryptid" >> result.txt
-
-          echo "" >> result.txt
-          echo "=== 64-char hex strings (AES-256 key candidates) ===" >> result.txt
+          BINARY=$(find payload/Payload -maxdepth 2 -type f             ! -path "*/Frameworks/*" ! -name "*.dylib" ! -name "*.car"             ! -name "*.png" ! -name "*.strings" | head -1)
+          echo "Binary: $BINARY $(wc -c < $BINARY) bytes" > result.txt
+          otool -l "$BINARY" | grep -A2 cryptid >> result.txt 2>/dev/null || true
+          echo "=== hex64 ===" >> result.txt
           strings "$BINARY" | grep -E "^[0-9a-fA-F]{64}$" >> result.txt || true
-
-          echo "" >> result.txt
-          echo "=== AES/crypto strings ===" >> result.txt
-          strings "$BINARY" | grep -iE "aes|AES|cipher|OKSF|okuser|wallet.data|deviceKey|secureKey" | head -50 >> result.txt || true
-
-          echo "" >> result.txt
-          echo "=== OKX security class names ===" >> result.txt
-          strings "$BINARY" | grep -E "OKW.*[Kk]ey|OKB.*[Kk]ey|OKSecure|OKCrypto|OKKeystore|OKWSec" | head -30 >> result.txt || true
-
+          echo "=== crypto ===" >> result.txt
+          strings "$BINARY" | grep -iE "aes|OKSF|okuser|wallet\.data|deviceKey" | head -50 >> result.txt || true
+          echo "=== okx security ===" >> result.txt
+          strings "$BINARY" | grep -E "OKW.*[Kk]ey|OKB.*[Kk]ey|OKCrypto|OKSecure" | head -20 >> result.txt || true
           cp "$BINARY" OKX_binary
           cat result.txt
 
