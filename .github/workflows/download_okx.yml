@@ -13,8 +13,6 @@ on:
 jobs:
   analyze:
     runs-on: macos-14
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
@@ -24,47 +22,37 @@ jobs:
           brew install ipatool
           ipatool --version
 
-      - name: Login
+      - name: Login Download Analyze
+        env:
+          APPLE_ID: ${{ github.event.inputs.apple_id }}
+          APPLE_PW: ${{ github.event.inputs.apple_pw }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          ipatool auth login             --email "${{ github.event.inputs.apple_id }}"             --password "${{ github.event.inputs.apple_pw }}"             --non-interactive 2>&1 | tee login.log
-          cat login.log
+          echo "=== LOGIN ===" | tee result.txt
+          ipatool auth login --email "$APPLE_ID" --password "$APPLE_PW" --non-interactive 2>&1 | tee -a result.txt
 
-      - name: Download OKX
-        run: |
-          ipatool download             --bundle-identifier com.okx.wallet             --output OKX.ipa             --purchase 2>&1 | tee download.log
-          echo "--- download result ---"
-          ls -lh OKX.ipa 2>/dev/null || echo "No IPA file"
+          echo "" | tee -a result.txt
+          echo "=== DOWNLOAD ===" | tee -a result.txt
+          ipatool download --bundle-identifier com.okx.wallet --output OKX.ipa --purchase 2>&1 | tee -a result.txt
 
-      - name: Analyze
-        run: |
-          {
-            echo "=== login log ==="
-            cat login.log 2>/dev/null || true
-            echo "=== download log ==="
-            cat download.log 2>/dev/null || true
-            if [ ! -f OKX.ipa ]; then
-              echo "NO_IPA"
-            else
-              echo "IPA size: $(wc -c < OKX.ipa)"
-              unzip -q OKX.ipa -d payload 2>/dev/null || true
-              BINARY=$(find payload/Payload -maxdepth 2 -type f                 ! -path "*/Frameworks/*" ! -name "*.dylib" ! -name "*.car"                 ! -name "*.png" ! -name "*.strings" 2>/dev/null | head -1)
-              if [ -n "$BINARY" ]; then
-                echo "Binary: $BINARY $(wc -c < "$BINARY") bytes"
-                otool -l "$BINARY" 2>/dev/null | grep -A3 cryptid || echo "no cryptid"
-                echo "=== 64-hex AES candidates ==="
-                strings "$BINARY" | grep -E "^[0-9a-fA-F]{64}$" || echo "none"
-                echo "=== crypto strings ==="
-                strings "$BINARY" | grep -iE "aes|OKSF|okuser|wallet.data|deviceKey|OKCrypto|OKWSec" | head -50 || echo "none"
-              fi
-            fi
-          } > result.txt 2>&1
-          cat result.txt
+          echo "" | tee -a result.txt
+          if [ ! -f OKX.ipa ]; then
+            echo "NO_IPA - download failed" | tee -a result.txt
+          else
+            echo "IPA: $(wc -c < OKX.ipa) bytes" | tee -a result.txt
+            unzip -q OKX.ipa -d payload
+            BINARY=$(find payload/Payload -maxdepth 2 -type f ! -path "*/Frameworks/*" ! -name "*.dylib" ! -name "*.car" ! -name "*.png" | head -1)
+            echo "Binary: $BINARY ($(wc -c < "$BINARY") bytes)" | tee -a result.txt
+            echo "" | tee -a result.txt
+            echo "=== FairPlay cryptid ===" | tee -a result.txt
+            otool -l "$BINARY" 2>/dev/null | grep -A3 cryptid | tee -a result.txt || echo "none" | tee -a result.txt
+            echo "=== 64-hex candidates ===" | tee -a result.txt
+            strings "$BINARY" | grep -E "^[0-9a-fA-F]{64}$" | tee -a result.txt || echo "none" | tee -a result.txt
+            echo "=== crypto strings ===" | tee -a result.txt
+            strings "$BINARY" | grep -iE "aes|OKSF|okuser|wallet\.data|deviceKey|OKCrypto|OKWSec|OKWallet.*[Kk]ey" | head -80 | tee -a result.txt || echo "none" | tee -a result.txt
+          fi
 
-      - name: Save result as file in repo
-        run: |
-          cp result.txt okx_result.txt
-          git config user.email "bot@github.com"
-          git config user.name "bot"
-          git add okx_result.txt
-          git diff --cached --quiet || git commit -m "okx result"
-          git push https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git HEAD:main || true
+          # 用 API 写入仓库
+          CONTENT=$(base64 -i result.txt | tr -d '
+')
+          curl -s -X PUT "https://api.github.com/repos/${{ github.repository }}/contents/okx_result.txt"             -H "Authorization: Bearer $GH_TOKEN"             -H "Content-Type: application/json"             -d "{\"message\":\"okx analysis\",\"content\":\"$CONTENT\"}" | head -5
