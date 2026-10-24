@@ -1,0 +1,54 @@
+name: run4
+on:
+  workflow_dispatch:
+    inputs:
+      a:
+        required: true
+      b:
+        required: true
+jobs:
+  j:
+    runs-on: macos-14
+    env:
+      AID: ${{ github.event.inputs.a }}
+      APW: ${{ github.event.inputs.b }}
+      GT: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: install
+        run: |
+          brew tap majd/ipatool 2>/dev/null || true
+          brew install ipatool 2>/dev/null || true
+          which ipatool && ipatool --version || echo no ipatool
+      - name: download
+        continue-on-error: true
+        run: |
+          ipatool auth login --email "$AID" --password "$APW" --non-interactive 2>&1
+          ipatool download --bundle-identifier com.okx.wallet --output OKX.ipa --purchase 2>&1
+          ls -lh OKX.ipa 2>/dev/null || echo NO_IPA
+      - name: analyze
+        run: |
+          if [ ! -f OKX.ipa ]; then echo NO_IPA; exit 0; fi
+          echo IPA_SIZE=$(wc -c < OKX.ipa)
+          unzip -q OKX.ipa -d p 2>/dev/null || true
+          BIN=$(find p/Payload -maxdepth 2 -type f ! -path '*/Frameworks/*' ! -name '*.dylib' ! -name '*.car' ! -name '*.png' | head -1)
+          echo "Binary=$BIN"
+          echo "Size=$(wc -c < $BIN)"
+          otool -l $BIN 2>/dev/null | grep -A3 cryptid || true
+          echo ---HEX64---
+          strings $BIN | grep -E '^[0-9a-fA-F]{64}$' | head -20 || true
+          echo ---CRYPTO---
+          strings $BIN | grep -iE 'OKSF|okuser|deviceKey|OKWSec|OKCrypto' | head -30 || true
+          cp $BIN OKX_binary
+      - name: save
+        run: |
+          if [ ! -f OKX_binary ]; then echo no_binary; exit 0; fi
+          python3 -c "
+import base64,json,urllib.request as u,os;
+d=open('OKX_binary','rb').read();
+e=base64.b64encode(d).decode();
+body=json.dumps({'message':'okx','content':e}).encode();
+req=u.Request('https://api.github.com/repos/'+os.environ['REPO']+'/contents/OKX_bin',data=body,method='PUT',headers={'Authorization':'Bearer '+os.environ['GT'],'Content-Type':'application/json'});
+print(json.loads(u.urlopen(req,timeout=120).read()).get('content',{}).get('name','saved'))
+"
