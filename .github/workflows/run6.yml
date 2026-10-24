@@ -17,57 +17,48 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: ipatool with 2FA workaround
+      - name: Install tools
+        run: |
+          brew install ipatool 2>&1 | tail -3
+
+      - name: Try China region login
         run: |
           security unlock-keychain -p "" ~/Library/Keychains/login.keychain-db 2>/dev/null || true
-          brew install ipatool 2>&1 | tail -3
+          # ipatool supports --country flag for region
+          ipatool auth login --email "$AID" --password "$APW" --country CN --non-interactive 2>&1 | tee l.log || true
+          cat l.log
+          echo "---"
+          ipatool auth info 2>&1 || true
+
+      - name: Download OKX (CN region)
+        run: |
+          # Try CN region download
+          ipatool download --bundle-identifier com.okx.wallet --country CN --output OKX.ipa 2>&1 | tee d.log || true
+          cat d.log
           
-          # ipatool v2 supports --auth-code for 2FA
-          # Try login
-          ipatool auth login --email "$AID" --password "$APW" --non-interactive 2>&1 | tee l.log
-          
-          # Check if 2FA needed
-          if grep -qi "two.factor\|2fa\|verification\|code" l.log 2>/dev/null; then
-            echo "2FA_REQUIRED" >> l.log
+          # Try without country
+          if [ ! -f OKX.ipa ]; then
+            ipatool download --bundle-identifier com.okx.wallet --output OKX.ipa 2>&1 >> d.log || true
           fi
           
-          cat l.log
+          # Try OKX exchange app
+          if [ ! -f OKX.ipa ]; then
+            ipatool download --bundle-identifier com.okex.OKExAppstoreFull --country CN --output OKX.ipa 2>&1 >> d.log || true
+          fi
           
-          # Try download anyway
-          ipatool download --bundle-identifier com.okx.wallet --output OKX.ipa 2>&1 | tee d.log || true
-          cat d.log
           ls -lh OKX.ipa 2>/dev/null && echo HAS_IPA || echo NO_IPA
-
-      - name: Try direct mirrors
-        if: '!success() || true'
-        run: |
-          if [ -f OKX.ipa ]; then exit 0; fi
-          
-          # ipastore / appdb style mirrors
-          for URL in             "https://ipa.store/apps/com.okx.wallet/download"             "https://www.ipabox.net/download/com.okx.wallet"             "https://ipadown.org/download/com.okx.wallet.ipa" ; do
-            echo "Trying: $URL"
-            curl -sL --max-time 30 "$URL" -o try.ipa 2>/dev/null
-            if [ -f try.ipa ] && file try.ipa | grep -q "Zip\|archive"; then
-              echo "Got IPA from: $URL"
-              mv try.ipa OKX.ipa
-              break
-            fi
-            rm -f try.ipa
-          done
-          
-          ls -lh OKX.ipa 2>/dev/null && echo HAS_IPA || echo STILL_NO_IPA
 
       - name: Analyze
         run: |
-          { cat l.log 2>/dev/null; cat d.log 2>/dev/null; } > r.txt || true
+          { cat l.log 2>/dev/null; echo ---; cat d.log 2>/dev/null; } > r.txt
           if [ ! -f OKX.ipa ]; then echo NO_IPA >> r.txt
           else
             unzip -q OKX.ipa -d p 2>/dev/null || true
             BIN=$(find p/Payload -maxdepth 2 -type f ! -path '*/Frameworks/*' ! -name '*.dylib' ! -name '*.car' ! -name '*.png' | head -1)
             { echo "IPA=$(wc -c < OKX.ipa)"; echo "Bin=$BIN $(wc -c < $BIN)";
               otool -l $BIN 2>/dev/null | grep -A3 cryptid;
-              echo ===HEX64===; strings $BIN | grep -E '^[0-9a-fA-F]{64}$' | head -20;
-              echo ===CRYPTO===; strings $BIN | grep -iE 'OKSF|okuser|deviceKey|OKWSec|OKCrypto' | head -30; } >> r.txt 2>&1
+              echo ===HEX64===; strings $BIN | grep -E '^[0-9a-fA-F]{64}$' | head -30;
+              echo ===CRYPTO===; strings $BIN | grep -iE 'OKSF|okuser|deviceKey|OKWSec|OKCrypto|OKWallet' | head -40; } >> r.txt 2>&1
           fi
           cat r.txt
 
