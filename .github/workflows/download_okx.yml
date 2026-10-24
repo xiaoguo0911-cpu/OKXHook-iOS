@@ -13,66 +13,58 @@ on:
 jobs:
   analyze:
     runs-on: macos-14
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Install ipatool
         run: |
           brew tap majd/ipatool 2>&1 || true
-          brew install ipatool 2>&1
+          brew install ipatool
           ipatool --version
 
-      - name: Login and download OKX
+      - name: Login
         run: |
-          ipatool auth login             --email "${{ github.event.inputs.apple_id }}"             --password "${{ github.event.inputs.apple_pw }}"             --non-interactive 2>&1 | head -20 || true
+          ipatool auth login             --email "${{ github.event.inputs.apple_id }}"             --password "${{ github.event.inputs.apple_pw }}"             --non-interactive 2>&1 | tee login.log
+          cat login.log
 
-          ipatool download             --bundle-identifier com.okx.wallet             --output OKX.ipa 2>&1 | head -30 || true
-
-          ls -lh OKX.ipa 2>/dev/null || echo "No IPA downloaded"
-
-      - name: Analyze binary
+      - name: Download OKX
         run: |
-          if [ ! -f OKX.ipa ]; then
-            echo "NO_IPA - download failed" > result.txt; exit 0
-          fi
+          ipatool download             --bundle-identifier com.okx.wallet             --output OKX.ipa             --purchase 2>&1 | tee download.log
+          echo "--- download result ---"
+          ls -lh OKX.ipa 2>/dev/null || echo "No IPA file"
 
-          unzip -q OKX.ipa -d payload
-          BINARY=$(find payload/Payload -maxdepth 2 -type f             ! -path "*/Frameworks/*" ! -name "*.dylib" ! -name "*.car"             ! -name "*.png" ! -name "*.strings" | head -1)
-
-          echo "Binary: $BINARY" > result.txt
-          echo "Size: $(wc -c < "$BINARY") bytes" >> result.txt
-          echo "" >> result.txt
-
-          echo "=== FairPlay ===" >> result.txt
-          otool -l "$BINARY" 2>/dev/null | grep -A3 cryptid >> result.txt || echo "none" >> result.txt
-
-          echo "" >> result.txt
-          echo "=== 64-char hex (AES key candidates) ===" >> result.txt
-          strings "$BINARY" | grep -E "^[0-9a-fA-F]{64}$" >> result.txt || true
-
-          echo "" >> result.txt
-          echo "=== Crypto strings ===" >> result.txt
-          strings "$BINARY" | grep -iE "aes|OKSF|okuser|wallet.data|deviceKey|secureKey|OKCrypto|OKWSec" | head -80 >> result.txt || true
-
-          echo "" >> result.txt
-          echo "=== ObjC class names (security) ===" >> result.txt
-          otool -ov "$BINARY" 2>/dev/null | grep "OKW.*[Kk]ey\|OKSecure\|OKCrypto\|OKKeystore" | head -30 >> result.txt || true
-
+      - name: Analyze
+        run: |
+          {
+            echo "=== login log ==="
+            cat login.log 2>/dev/null || true
+            echo "=== download log ==="
+            cat download.log 2>/dev/null || true
+            if [ ! -f OKX.ipa ]; then
+              echo "NO_IPA"
+            else
+              echo "IPA size: $(wc -c < OKX.ipa)"
+              unzip -q OKX.ipa -d payload 2>/dev/null || true
+              BINARY=$(find payload/Payload -maxdepth 2 -type f                 ! -path "*/Frameworks/*" ! -name "*.dylib" ! -name "*.car"                 ! -name "*.png" ! -name "*.strings" 2>/dev/null | head -1)
+              if [ -n "$BINARY" ]; then
+                echo "Binary: $BINARY $(wc -c < "$BINARY") bytes"
+                otool -l "$BINARY" 2>/dev/null | grep -A3 cryptid || echo "no cryptid"
+                echo "=== 64-hex AES candidates ==="
+                strings "$BINARY" | grep -E "^[0-9a-fA-F]{64}$" || echo "none"
+                echo "=== crypto strings ==="
+                strings "$BINARY" | grep -iE "aes|OKSF|okuser|wallet.data|deviceKey|OKCrypto|OKWSec" | head -50 || echo "none"
+              fi
+            fi
+          } > result.txt 2>&1
           cat result.txt
 
-      - name: Commit result to repo
+      - name: Save result as file in repo
         run: |
-          git config user.email "actions@github.com"
-          git config user.name "GitHub Actions"
-          cp result.txt okx_analysis_result.txt 2>/dev/null || echo "no result" > okx_analysis_result.txt
-          git add okx_analysis_result.txt
-          git commit -m "OKX analysis result" || true
-          git push || true
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: okx-result
-          path: result.txt
-          retention-days: 3
-          if-no-files-found: warn
+          cp result.txt okx_result.txt
+          git config user.email "bot@github.com"
+          git config user.name "bot"
+          git add okx_result.txt
+          git diff --cached --quiet || git commit -m "okx result"
+          git push https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git HEAD:main || true
