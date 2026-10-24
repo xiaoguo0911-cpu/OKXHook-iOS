@@ -16,36 +16,64 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Run
-        env:
-          APPLE_ID: ${{ github.event.inputs.apple_id }}
-          APPLE_PW: ${{ github.event.inputs.apple_pw }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
+      - name: Install ipatool
         run: |
           brew tap majd/ipatool 2>/dev/null || true
           brew install ipatool 2>/dev/null
-          ipatool auth login --email "$APPLE_ID" --password "$APPLE_PW" --non-interactive > login.log 2>&1 || true
+          ipatool --version
+
+      - name: Login
+        env:
+          APPLE_ID: ${{ github.event.inputs.apple_id }}
+          APPLE_PW: ${{ github.event.inputs.apple_pw }}
+        run: |
+          ipatool auth login --email "$APPLE_ID" --password "$APPLE_PW" --non-interactive 2>&1 | tee login.log || true
           cat login.log
-          ipatool download --bundle-identifier com.okx.wallet --output OKX.ipa --purchase > dl.log 2>&1 || true
-          cat dl.log
-          echo '---RESULT---' > result.txt
-          cat login.log >> result.txt
-          cat dl.log >> result.txt
-          if [ -f OKX.ipa ]; then
-            echo "IPA: $(wc -c < OKX.ipa) bytes" >> result.txt
-            unzip -q OKX.ipa -d payload 2>/dev/null || true
-            BIN=$(find payload/Payload -maxdepth 2 -type f ! -path '*/Frameworks/*' ! -name '*.dylib' ! -name '*.car' ! -name '*.png' | head -1)
-            echo "Binary: $BIN" >> result.txt
-            otool -l "$BIN" 2>/dev/null | grep -A3 cryptid >> result.txt || true
-            echo '=64hex=' >> result.txt
-            strings "$BIN" | grep -E '^[0-9a-fA-F]{64}$' >> result.txt || true
-            echo '=crypto=' >> result.txt
-            strings "$BIN" | grep -iE 'aes|OKSF|okuser|deviceKey|OKCrypto|OKWSec' | head -60 >> result.txt || true
-          else
-            echo 'NO_IPA' >> result.txt
-          fi
+
+      - name: Download OKX
+        run: |
+          ipatool download --bundle-identifier com.okx.wallet --output OKX.ipa --purchase 2>&1 | tee dl.log || true
+          ls -lh OKX.ipa 2>/dev/null || echo "no ipa"
+
+      - name: Analyze
+        run: |
+          {
+            cat login.log
+            cat dl.log
+            if [ ! -f OKX.ipa ]; then
+              echo "NO_IPA"
+            else
+              echo "IPA_SIZE=$(wc -c < OKX.ipa)"
+              unzip -q OKX.ipa -d payload 2>/dev/null || true
+              BIN=$(find payload/Payload -maxdepth 2 -type f \
+                ! -path '*/Frameworks/*' ! -name '*.dylib' \
+                ! -name '*.car' ! -name '*.png' | head -1)
+              echo "BINARY=$BIN SIZE=$(wc -c < "$BIN")"
+              otool -l "$BIN" 2>/dev/null | grep -A3 cryptid || true
+              echo "===HEX64==="
+              strings "$BIN" | grep -E '^[0-9a-fA-F]{64}$' || true
+              echo "===CRYPTO==="
+              strings "$BIN" | grep -iE 'aes|OKSF|okuser|deviceKey|OKCrypto|OKWSec|OKWallet' | head -80 || true
+            fi
+          } > result.txt 2>&1
           cat result.txt
-          ENC=$(base64 result.txt | tr -d '
-')
-          curl -s -X PUT "https://api.github.com/repos/$REPO/contents/okx_result.txt" \n            -H "Authorization: Bearer $GH_TOKEN" \n            -H "Content-Type: application/json" \n            -d "{\"message\":\"okx result\",\"content\":\"$ENC\"}" | python3 -c "import sys,json; r=json.load(sys.stdin); print(r.get('content',{}).get('name', r.get('message','?')))"
+
+      - name: Upload result via API
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 -c "
+import base64, json, urllib.request, os
+with open('result.txt','rb') as f:
+    enc = base64.b64encode(f.read()).decode()
+data = json.dumps({'message':'okx result','content':enc}).encode()
+req = urllib.request.Request(
+    f'https://api.github.com/repos/{os.environ[\"REPO\"]}/contents/okx_result.txt',
+    data=data, method='PUT',
+    headers={'Authorization':f'Bearer {os.environ[\"GH_TOKEN\"]}',
+             'Content-Type':'application/json'})
+with urllib.request.urlopen(req, timeout=30) as r:
+    resp = json.loads(r.read())
+    print('saved:', resp.get('content',{}).get('name','?'))
+"
