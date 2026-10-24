@@ -18,90 +18,77 @@ jobs:
 
       - name: Install ipatool
         run: |
-          curl -sL https://github.com/majd/ipatool/releases/download/v2.7.0/ipatool-2.7.0-macos-arm64.tar.gz -o ipatool.tar.gz
+          set -e
+          echo "Downloading ipatool v2.7.0..."
+          curl -fsSL \
+            "https://github.com/majd/ipatool/releases/download/v2.7.0/ipatool-2.7.0-macos-arm64.tar.gz" \
+            -o ipatool.tar.gz
           tar xzf ipatool.tar.gz
-          chmod +x ipatool
-          ./ipatool --version
+          ls -la
+          # 找可执行文件
+          find . -name "ipatool*" -type f | head -5
+          TOOL=$(find . -name "ipatool" -type f | head -1)
+          echo "Found: $TOOL"
+          chmod +x "$TOOL"
+          mv "$TOOL" ./ipatool_bin
+          ./ipatool_bin --version
 
-      - name: Login to App Store
+      - name: Login and Download OKX
         run: |
-          ./ipatool auth login \
+          ./ipatool_bin auth login \
             --email "${{ github.event.inputs.apple_id }}" \
             --password "${{ github.event.inputs.apple_pw }}" \
-            --non-interactive 2>&1 || true
-          ./ipatool auth info 2>&1 || true
+            --non-interactive 2>&1 | head -20 || true
 
-      - name: Download OKX Wallet IPA
-        run: |
-          # OKX Wallet: bundle=com.okx.wallet, appId=6743309484
-          ./ipatool download \
+          echo "--- Downloading OKX Wallet ---"
+          ./ipatool_bin download \
             --bundle-identifier com.okx.wallet \
-            --output OKX_Wallet.ipa \
-            --purchase 2>&1 || \
-          ./ipatool download \
-            --app-id 6743309484 \
-            --output OKX_Wallet.ipa 2>&1 || true
+            --output OKX.ipa 2>&1 | head -30 || \
+          ./ipatool_bin download \
+            --bundle-identifier com.okex.OKExAppstoreFull \
+            --output OKX.ipa 2>&1 | head -30 || true
 
-          # 备用: OKX Exchange
-          if [ ! -f OKX_Wallet.ipa ]; then
-            ./ipatool download \
-              --bundle-identifier com.okex.OKExAppstoreFull \
-              --output OKX_Wallet.ipa 2>&1 || true
-          fi
+          ls -lh *.ipa 2>/dev/null || echo "Download failed"
 
-          ls -lh *.ipa 2>/dev/null || echo "No IPA"
-          file OKX_Wallet.ipa 2>/dev/null || true
-
-      - name: Extract binary and analyze
+      - name: Analyze binary
         run: |
-          if [ ! -f OKX_Wallet.ipa ]; then
-            echo "IPA download failed" > result.txt
+          if [ ! -f OKX.ipa ]; then
+            echo "NO_IPA" > result.txt
             exit 0
           fi
 
-          unzip -q OKX_Wallet.ipa -d OKX_ext
-          BINARY=$(find OKX_ext/Payload -maxdepth 2 -type f ! -name "*.dylib" ! -name "*.nib" ! -name "*.car" ! -name "*.png" | head -1)
-          echo "Binary: $BINARY"
+          unzip -q OKX.ipa -d payload
+          BINARY=$(find payload/Payload -maxdepth 2 -type f \
+            ! -path "*/Frameworks/*" \
+            ! -name "*.dylib" ! -name "*.car" ! -name "*.png" \
+            ! -name "*.strings" ! -name "*.nib" | head -1)
 
-          if [ -z "$BINARY" ]; then
-            echo "No binary found" > result.txt
-            exit 0
-          fi
+          echo "Binary: $BINARY ($(wc -c < "$BINARY") bytes)" > result.txt
+          file "$BINARY" >> result.txt
 
-          file "$BINARY"
-          cp "$BINARY" ./OKX_binary
-          ls -lh OKX_binary
-
-          # 检查 FairPlay 加密状态
-          echo "=== Encryption check ===" > result.txt
-          otool -l OKX_binary | grep -A5 "LC_ENCRYPTION_INFO\|cryptid" >> result.txt 2>/dev/null || true
-
-          # 搜索 32字节 hex AES key 候选
           echo "" >> result.txt
-          echo "=== 32-byte hex (AES-256 key candidates) ===" >> result.txt
-          strings OKX_binary | grep -E "^[0-9a-fA-F]{64}$" >> result.txt 2>/dev/null || true
+          echo "=== FairPlay encryption ===" >> result.txt
+          otool -l "$BINARY" | grep -A3 cryptid >> result.txt 2>/dev/null || echo "no cryptid" >> result.txt
 
-          # 搜索加密相关字符串
           echo "" >> result.txt
-          echo "=== Crypto strings ===" >> result.txt
-          strings OKX_binary | grep -iE "aes|cipher|encrypt|decrypt|pbkdf|okuser|OKSF|wallet\.data|hardcode|secureKey|deviceKey" >> result.txt 2>/dev/null | head -100 || true
+          echo "=== 64-char hex strings (AES-256 key candidates) ===" >> result.txt
+          strings "$BINARY" | grep -E "^[0-9a-fA-F]{64}$" >> result.txt || true
 
-          # OKX 安全相关 class
           echo "" >> result.txt
-          echo "=== OKX security classes ===" >> result.txt
-          strings OKX_binary | grep -iE "OKWSec|OKBSec|OKCrypto|OKKeystore|OKWallet.*[Kk]ey|OKSecure|OKWCipher|OKUserSec" >> result.txt 2>/dev/null || true
+          echo "=== AES/crypto strings ===" >> result.txt
+          strings "$BINARY" | grep -iE "aes|AES|cipher|OKSF|okuser|wallet.data|deviceKey|secureKey" | head -50 >> result.txt || true
 
-          # base64 encoded 32-byte keys
           echo "" >> result.txt
-          echo "=== Base64 key candidates (44 chars) ===" >> result.txt
-          strings OKX_binary | grep -E "^[A-Za-z0-9+/]{43}=$" >> result.txt 2>/dev/null | head -30 || true
+          echo "=== OKX security class names ===" >> result.txt
+          strings "$BINARY" | grep -E "OKW.*[Kk]ey|OKB.*[Kk]ey|OKSecure|OKCrypto|OKKeystore|OKWSec" | head -30 >> result.txt || true
 
+          cp "$BINARY" OKX_binary
           cat result.txt
 
-      - name: Upload artifacts
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: okx-analysis
+          name: okx-result
           path: |
             result.txt
             OKX_binary
