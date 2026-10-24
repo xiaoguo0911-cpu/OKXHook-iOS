@@ -1,0 +1,29 @@
+name: Build OKXHook dylib
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode_16.2.app/Contents/Developer 2>/dev/null ||           sudo xcode-select -s $(ls -d /Applications/Xcode_*.app | sort -V | tail -1)/Contents/Developer || true
+          xcodebuild -version
+
+      - name: Build OKXHook.dylib (arm64)
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          clang -dynamiclib             -arch arm64             -isysroot $SDK             -framework Foundation             -framework Security             -lc             -o OKXHook.dylib OKXHook.m
+          ls -lh OKXHook.dylib
+          file OKXHook.dylib
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OKXHook-dylib
+          path: OKXHook.dylib
+          retention-days: 7
