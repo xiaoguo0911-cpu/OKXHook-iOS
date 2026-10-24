@@ -1,0 +1,32 @@
+name: run3
+on:
+  workflow_dispatch:
+    inputs:
+      a:
+        required: true
+      b:
+        required: true
+jobs:
+  j:
+    runs-on: macos-14
+    env:
+      AID: ${{ github.event.inputs.a }}
+      APW: ${{ github.event.inputs.b }}
+      GT: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          brew tap majd/ipatool 2>/dev/null || true
+          brew install ipatool 2>/dev/null
+          ipatool auth login --email "$AID" --password "$APW" --non-interactive 2>&1
+          ipatool download --bundle-identifier com.okx.wallet --output OKX.ipa --purchase 2>&1 || true
+          ls -lh OKX.ipa 2>/dev/null && echo HAS_IPA || echo NO_IPA
+          if [ -f OKX.ipa ]; then
+            unzip -q OKX.ipa -d p
+            BIN=$(find p/Payload -maxdepth 2 -type f ! -path '*/Frameworks/*' ! -name '*.dylib' ! -name '*.car' ! -name '*.png' | head -1)
+            echo "Binary: $BIN $(wc -c < $BIN) bytes"
+            otool -l $BIN | grep -A3 cryptid || true
+            strings $BIN | grep -E '^[0-9a-fA-F]{64}$' | head -20
+            strings $BIN | grep -iE 'OKSF|okuser|deviceKey|OKWSec|OKCrypto|OKWallet' | head -30
+          fi
