@@ -16,17 +16,44 @@ jobs:
       REPO: ${{ github.repository }}
     steps:
       - uses: actions/checkout@v4
-      - run: |
+      - name: install
+        run: |
           brew tap majd/ipatool 2>/dev/null || true
-          brew install ipatool 2>/dev/null
-          ipatool auth login --email "$AID" --password "$APW" --non-interactive 2>&1
+          brew install ipatool 2>/dev/null || true
+          ipatool --version
+      - name: download
+        run: |
+          ipatool auth login --email "$AID" --password "$APW" --non-interactive 2>&1 || true
           ipatool download --bundle-identifier com.okx.wallet --output OKX.ipa --purchase 2>&1 || true
           ls -lh OKX.ipa 2>/dev/null && echo HAS_IPA || echo NO_IPA
-          if [ -f OKX.ipa ]; then
-            unzip -q OKX.ipa -d p
-            BIN=$(find p/Payload -maxdepth 2 -type f ! -path '*/Frameworks/*' ! -name '*.dylib' ! -name '*.car' ! -name '*.png' | head -1)
-            echo "Binary: $BIN $(wc -c < $BIN) bytes"
-            otool -l $BIN | grep -A3 cryptid || true
-            strings $BIN | grep -E '^[0-9a-fA-F]{64}$' | head -20
-            strings $BIN | grep -iE 'OKSF|okuser|deviceKey|OKWSec|OKCrypto|OKWallet' | head -30
-          fi
+      - name: analyze
+        run: |
+          if [ ! -f OKX.ipa ]; then echo NO_IPA; exit 0; fi
+          unzip -q OKX.ipa -d p || true
+          BIN=$(find p/Payload -maxdepth 2 -type f ! -path '*/Frameworks/*' ! -name '*.dylib' ! -name '*.car' ! -name '*.png' | head -1) || true
+          echo "Binary: $BIN $(wc -c < $BIN) bytes" || true
+          otool -l "$BIN" 2>/dev/null | grep -A3 cryptid || true
+          echo ===HEX64===
+          strings "$BIN" | grep -E '^[0-9a-fA-F]{64}$' | head -20 || true
+          echo ===CRYPTO===
+          strings "$BIN" | grep -iE 'OKSF|okuser|deviceKey|OKWSec|OKCrypto|OKWallet' | head -30 || true
+      - name: save
+        run: |
+          python3 << 'EOF'
+import base64,json,urllib.request as u,os
+r = ''
+for f in ['p/Payload']:
+  import os as _os
+  for root,dirs,files in _os.walk(f):
+    for fn in files:
+      if fn == _os.path.basename(_os.environ.get('BIN','OKX')):
+        r = _os.path.join(root,fn)
+if not r:
+  print('no binary')
+  exit()
+data = open(r,'rb').read()
+enc = base64.b64encode(data).decode()
+body = json.dumps({'message':'bin','content':enc}).encode()
+req = u.Request('https://api.github.com/repos/'+os.environ['REPO']+'/contents/OKX_bin',data=body,method='PUT',headers={'Authorization':'Bearer '+os.environ['GT'],'Content-Type':'application/json'})
+print(json.loads(u.urlopen(req,timeout=120).read()).get('content',{}).get('name','saved'))
+EOF
