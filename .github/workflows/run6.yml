@@ -1,0 +1,55 @@
+name: run6
+on:
+  workflow_dispatch:
+    inputs:
+      a:
+        required: true
+      b:
+        required: true
+jobs:
+  j:
+    runs-on: macos-14
+    env:
+      AID: ${{ github.event.inputs.a }}
+      APW: ${{ github.event.inputs.b }}
+      GT: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ipatool
+        run: |
+          brew tap majd/ipatool 2>&1 || true
+          brew install ipatool 2>&1
+          ipatool --version
+
+      - name: Login and Download
+        run: |
+          ipatool auth login --email "$AID" --password "$APW" --non-interactive 2>&1 | tee login.log || true
+          ipatool download --bundle-identifier com.okx.wallet --output OKX.ipa --purchase 2>&1 | tee dl.log || true
+          ls -lh OKX.ipa 2>/dev/null && echo HAS_IPA || echo NO_IPA
+
+      - name: Analyze
+        run: |
+          { cat login.log; cat dl.log; } > r.txt 2>/dev/null || true
+          if [ ! -f OKX.ipa ]; then
+            echo NO_IPA >> r.txt
+          else
+            echo "IPA=$(wc -c < OKX.ipa) bytes" >> r.txt
+            unzip -q OKX.ipa -d p 2>/dev/null || true
+            BIN=$(find p/Payload -maxdepth 2 -type f ! -path '*/Frameworks/*' ! -name '*.dylib' ! -name '*.car' ! -name '*.png' | head -1)
+            echo "Binary=$BIN Size=$(wc -c < $BIN)" >> r.txt
+            otool -l $BIN 2>/dev/null | grep -A3 cryptid >> r.txt || echo no_cryptid >> r.txt
+            echo ===HEX64=== >> r.txt
+            strings $BIN | grep -E '^[0-9a-fA-F]{64}$' | head -20 >> r.txt || true
+            echo ===CRYPTO=== >> r.txt
+            strings $BIN | grep -iE 'OKSF|okuser|deviceKey|OKWSec|OKCrypto' | head -30 >> r.txt || true
+          fi
+          cat r.txt
+
+      - name: Save
+        run: |
+          [ -f r.txt ] || echo NO_RESULT > r.txt
+          python3 -c "import base64; print(base64.b64encode(open('r.txt','rb').read()).decode())" > enc.b64
+          ENC=$(cat enc.b64)
+          curl -sf -X PUT "https://api.github.com/repos/$REPO/contents/r.txt"             -H "Authorization: Bearer $GT" -H "Content-Type: application/json"             -d "{\"message\":\"r\",\"content\":\"$ENC\"}"             && echo saved || echo save_failed
