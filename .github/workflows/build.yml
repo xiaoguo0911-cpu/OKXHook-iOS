@@ -17,9 +17,8 @@ jobs:
       - name: Build OKXHook.dylib (arm64)
         run: |
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-          clang -dynamiclib             -arch arm64             -isysroot $SDK             -framework Foundation             -framework Security             -o OKXHook.dylib OKXHook.m 2>&1
-          echo "exit: $?"
-          ls -lh OKXHook.dylib 2>/dev/null || echo "build failed"
+          clang -dynamiclib             -arch arm64             -isysroot $SDK             -framework Foundation             -framework Security             -Xlinker -undefined             -Xlinker dynamic_lookup             -o OKXHook.dylib OKXHook.m 2>&1
+          ls -lh OKXHook.dylib && file OKXHook.dylib
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -27,4 +26,3 @@ jobs:
           name: OKXHook-dylib
           path: OKXHook.dylib
           retention-days: 7
-          if-no-files-found: ignore
