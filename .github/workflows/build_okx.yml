@@ -1,0 +1,138 @@
+name: Build OKX Hooked IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      apple_id:
+        description: 'Apple ID email'
+        required: true
+      apple_password:
+        description: 'Apple ID password (app-specific)'
+        required: true
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ipatool
+        run: brew install ipatool
+
+      - name: Download OKX IPA from App Store
+        run: |
+          ipatool auth login -e "${{ inputs.apple_id }}" -p "${{ inputs.apple_password }}"
+          ipatool download --bundle-identifier com.okx.wallet --output okx_original.ipa
+          ls -la okx_original.ipa
+
+      - name: Install tools
+        run: |
+          pip3 install macholib
+
+      - name: Inject OKXHook + patch cryptid
+        run: |
+          python3 << 'PYTHON'
+          import zipfile, struct, shutil, os
+
+          # 解压 IPA
+          os.makedirs("work", exist_ok=True)
+          with zipfile.ZipFile("okx_original.ipa", 'r') as z:
+              z.extractall("work")
+          
+          # 找主 binary
+          import glob
+          bins = glob.glob("work/Payload/*.app/OKEx-WalletApp")
+          if not bins:
+              bins = glob.glob("work/Payload/*/*.app/*")
+          main_bin = bins[0] if bins else None
+          print(f"Main binary: {main_bin}")
+          
+          if main_bin:
+              with open(main_bin, 'rb') as f:
+                  data = bytearray(f.read())
+              
+              # patch cryptid = 0 (tell iOS binary is not FairPlay encrypted)
+              # LC_ENCRYPTION_INFO_64 = 0x2C
+              magic = struct.unpack_from('<I', data, 0)[0]
+              ncmds = struct.unpack_from('<I', data, 16)[0]
+              cmd_off = 32
+              for _ in range(ncmds):
+                  cmd, sz = struct.unpack_from('<II', data, cmd_off)
+                  if cmd in (0x21, 0x2C):
+                      # patch cryptid to 0
+                      struct.pack_into('<I', data, cmd_off + 16, 0)
+                      print(f"Patched cryptid=0 in LC_ENCRYPTION_INFO at 0x{cmd_off:x}")
+                  cmd_off += sz
+              
+              # 注入 OKXHook.dylib load command
+              # 查找是否已有
+              if b'OKXHook' in bytes(data):
+                  print("OKXHook already injected")
+              else:
+                  # 用 insert_dylib 等工具
+                  print("Need to inject OKXHook dylib")
+              
+              with open(main_bin, 'wb') as f:
+                  f.write(data)
+          
+          # 复制 OKXHook.dylib 到 Frameworks
+          fw_dir = "work/Payload/OKEx-WalletApp.app/Frameworks"
+          os.makedirs(fw_dir, exist_ok=True)
+          shutil.copy("OKXHook.dylib", os.path.join(fw_dir, "OKXHook.dylib"))
+          print("Copied OKXHook.dylib")
+          
+          # 删除 SC_Info 和 _CodeSignature（重新签名时会重建）
+          import shutil as sh
+          for path in glob.glob("work/Payload/**/**/SC_Info", recursive=True):
+              sh.rmtree(path, ignore_errors=True)
+          for path in glob.glob("work/Payload/**/**/CodeResources", recursive=True):
+              os.remove(path) if os.path.isfile(path) else None
+          
+          # 重新打包
+          with zipfile.ZipFile("okx_hooked.ipa", 'w', zipfile.ZIP_DEFLATED) as z:
+              for root, dirs, files in os.walk("work"):
+                  for file in files:
+                      fp = os.path.join(root, file)
+                      z.write(fp, os.path.relpath(fp, "work"))
+          
+          print(f"Created okx_hooked.ipa: {os.path.getsize('okx_hooked.ipa')/1024/1024:.1f} MB")
+          PYTHON
+
+      - name: Sign with ad-hoc certificate
+        run: |
+          # 生成临时证书
+          security create-keychain -p "" temp.keychain
+          security default-keychain -s temp.keychain
+          security unlock-keychain -p "" temp.keychain
+          
+          # 解压重签
+          mkdir -p resign_work
+          cd resign_work
+          unzip -q ../okx_hooked.ipa
+          
+          # 创建 entitlements
+          cat > entitlements.plist << 'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+          <key>application-identifier</key><string>TEAM.com.okx.wallet</string>
+          <key>get-task-allow</key><true/>
+          </dict></plist>
+          EOF
+          
+          # 用 ad-hoc 签名
+          find Payload -name "*.dylib" -o -name "*.framework" | while read f; do
+            codesign -f -s - "$f" 2>/dev/null || true
+          done
+          codesign -f -s - --entitlements entitlements.plist "Payload/OKEx-WalletApp.app" 2>/dev/null || true
+          
+          zip -qr ../okx_signed.ipa Payload
+          cd ..
+          ls -la okx_signed.ipa
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: okx-hooked-ipa
+          path: okx_signed.ipa
+          retention-days: 3
